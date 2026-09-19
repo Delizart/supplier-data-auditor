@@ -1,3 +1,4 @@
+
 import os
 import json
 
@@ -5,8 +6,15 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-from supplier_auditor.tools import check_missing_data
+from supplier_auditor.tools import (
+    check_missing_data,
+    validate_contacts,
+)
 
+
+# ============================================================
+# Configuration
+# ============================================================
 
 load_dotenv()
 
@@ -15,28 +23,70 @@ client = genai.Client(
 )
 
 
+# ============================================================
+# Tool Registry
+# ============================================================
+
+TOOL_REGISTRY = {
+    "check_missing_data": check_missing_data,
+    "validate_contacts": validate_contacts,
+}
+
+
+# ============================================================
+# Gemini Tool Definitions
+# ============================================================
+
+missing_data_tool = types.FunctionDeclaration(
+    name="check_missing_data",
+    description=(
+        "Check a supplier Excel file for missing required fields."
+    ),
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "file_path": types.Schema(
+                type=types.Type.STRING,
+                description="Path to the supplier Excel file."
+            )
+        },
+        required=["file_path"],
+    ),
+)
+
+
+contact_validation_tool = types.FunctionDeclaration(
+    name="validate_contacts",
+    description=(
+        "Validate supplier email and phone formats "
+        "in an Excel supplier database."
+    ),
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "file_path": types.Schema(
+                type=types.Type.STRING,
+                description="Path to the supplier Excel file."
+            )
+        },
+        required=["file_path"],
+    ),
+)
+
+
+tool_config = types.Tool(
+    function_declarations=[
+        missing_data_tool,
+        contact_validation_tool,
+    ]
+)
+
+
+# ============================================================
+# Agent
+# ============================================================
+
 def run_agent(file_path: str):
-
-    tool = types.FunctionDeclaration(
-        name="check_missing_data",
-        description=(
-            "Check a supplier Excel file for missing required fields."
-        ),
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "file_path": types.Schema(
-                    type=types.Type.STRING,
-                    description="Path to the supplier Excel file."
-                )
-            },
-            required=["file_path"],
-        ),
-    )
-
-    tool_config = types.Tool(
-        function_declarations=[tool]
-    )
 
     prompt = f"""
 You are a supplier data quality analyst.
@@ -45,14 +95,33 @@ Analyze the supplier database located at:
 
 {file_path}
 
-Use the check_missing_data tool to detect missing required fields.
+You have access to these tools:
 
-After receiving the tool result, provide a concise audit summary including:
+1. check_missing_data
+   Detect missing required supplier fields.
+
+2. validate_contacts
+   Validate supplier email and phone formats.
+
+Choose the appropriate tools based on the audit request.
+
+For a complete supplier data quality audit, use all relevant tools.
+
+After receiving the tool results, provide a concise audit summary including:
+
 - total number of issues
 - affected suppliers
-- missing fields
-- recommended next action
+- issue types
+- affected fields
+- severity
+- recommended next actions
+
+Do not invent information that is not present in the tool results.
 """
+
+    # --------------------------------------------------------
+    # STEP 1 — Ask Gemini whether a tool is needed
+    # --------------------------------------------------------
 
     response = client.models.generate_content(
         model="gemini-3.6-flash",
@@ -62,64 +131,105 @@ After receiving the tool result, provide a concise audit summary including:
         ),
     )
 
-    # -------------------------------------------------
-    # STEP 1: Check whether Gemini requested a tool
-    # -------------------------------------------------
+    # --------------------------------------------------------
+    # STEP 2 — Extract function calls
+    # --------------------------------------------------------
 
-    function_call = None
+    function_calls = []
 
     for part in response.candidates[0].content.parts:
-        if part.function_call:
-            function_call = part.function_call
-            break
 
-    if not function_call:
+        if part.function_call:
+            function_calls.append(part.function_call)
+
+    # No tool requested
+    if not function_calls:
+
         return response.text
 
-    print("\n=== TOOL CALL ===")
-    print("Tool:", function_call.name)
-    print("Arguments:", function_call.args)
+    # --------------------------------------------------------
+    # STEP 3 — Execute requested tools
+    # --------------------------------------------------------
 
-    # -------------------------------------------------
-    # STEP 2: Execute the requested Python function
-    # -------------------------------------------------
+    print("\n=== TOOL CALLS ===")
 
-    if function_call.name == "check_missing_data":
+    tool_response_parts = []
 
-        tool_result = check_missing_data(
-            function_call.args["file_path"]
+    for function_call in function_calls:
+
+        tool_name = function_call.name
+        arguments = dict(function_call.args)
+
+        print(f"\nTool: {tool_name}")
+        print(f"Arguments: {arguments}")
+
+        # ---------------------------------------------
+        # Find tool in registry
+        # ---------------------------------------------
+
+        if tool_name not in TOOL_REGISTRY:
+
+            raise ValueError(
+                f"Unknown tool requested by Gemini: {tool_name}"
+            )
+
+        tool_function = TOOL_REGISTRY[tool_name]
+
+        # ---------------------------------------------
+        # Execute Python function
+        # ---------------------------------------------
+
+        tool_result = tool_function(
+            arguments["file_path"]
         )
 
-    else:
-        raise ValueError(
-            f"Unknown tool: {function_call.name}"
+        print("\nTool result:")
+        print(
+            json.dumps(
+                tool_result,
+                indent=2,
+                ensure_ascii=False,
+            )
         )
 
-    print("\n=== TOOL RESULT ===")
-    print(json.dumps(tool_result, indent=2))
+        # ---------------------------------------------
+        # Prepare response for Gemini
+        # ---------------------------------------------
 
-    # -------------------------------------------------
-    # STEP 3: Send the result back to Gemini
-    # -------------------------------------------------
+        tool_response_parts.append(
+            types.Part.from_function_response(
+                name=tool_name,
+                response=tool_result,
+            )
+        )
 
-    tool_response_part = types.Part.from_function_response(
-        name=function_call.name,
-        response=tool_result,
-    )
+    # --------------------------------------------------------
+    # STEP 4 — Send tool results back to Gemini
+    # --------------------------------------------------------
 
     contents = [
         types.Content(
             role="user",
             parts=[
-                types.Part.from_text(text=prompt)
+                types.Part.from_text(
+                    text=prompt
+                )
             ],
         ),
+
+        # Gemini's previous function-call message
         response.candidates[0].content,
+
+        # Tool results
         types.Content(
             role="user",
-            parts=[tool_response_part],
+            parts=tool_response_parts,
         ),
     ]
+
+    # --------------------------------------------------------
+    # STEP 5 — Ask Gemini for final answer
+    # --------------------------------------------------------
 
     final_response = client.models.generate_content(
         model="gemini-3.6-flash",
@@ -132,11 +242,20 @@ After receiving the tool result, provide a concise audit summary including:
     return final_response.text
 
 
+# ============================================================
+# Main
+# ============================================================
+
 if __name__ == "__main__":
 
-    result = run_agent(
+    file_path = (
         "data/input/suppliers_sample.xlsx"
     )
 
-    print("\n=== FINAL AGENT RESPONSE ===")
+    result = run_agent(file_path)
+
+    print("\n")
+    print("=" * 60)
+    print("FINAL AGENT RESPONSE")
+    print("=" * 60)
     print(result)

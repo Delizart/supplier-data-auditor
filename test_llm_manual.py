@@ -1,14 +1,24 @@
-from supplier_auditor.llm.client import explain_issue
-
-
-result = explain_issue(
-    issue_type="INVALID_EMAIL",
-    field="email",
-    severity="MEDIUM",
-    details="Invalid email format: contact@invalid",
+from supplier_auditor.tools import (
+    check_missing_data,
+    validate_contacts,
 )
 
-print("\n=== GEMINI RESULT ===")
-print("Explanation:", result.explanation)
-print("Recommendation:", result.recommendation)
-print("Priority:", result.priority)
+
+file_path = "data/input/suppliers_sample.xlsx"
+
+
+print("\n=== MISSING DATA ===")
+
+result = check_missing_data(file_path)
+
+print("Total:", result["total_issues"])
+
+
+print("\n=== CONTACT VALIDATION ===")
+
+result = validate_contacts(file_path)
+
+print("Total:", result["total_issues"])
+
+for issue in result["issues"]:
+    print(issue)
