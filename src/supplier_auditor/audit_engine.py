@@ -2,8 +2,12 @@ from typing import List
 
 import pandas as pd
 
+import issue
+
 from .models import AuditIssue
 
+from .llm.client import explain_issue
+from .llm.models import IssueExplanation
 
 class AuditEngine:
 
@@ -45,3 +49,21 @@ class AuditEngine:
                 for issue in self.issues
             ]
         )
+
+    def explain_issue(self, issue: AuditIssue) -> IssueExplanation:
+        return explain_issue(
+            issue_type=issue.issue_type,
+            field=issue.field or "",
+            severity=issue.severity,
+            details=issue.details,
+        )
+
+    def explain_all_issues(self) -> dict[str, IssueExplanation]:
+        explanations = {}
+
+        for issue in self.issues:
+            key = f"{issue.supplier_id}:{issue.issue_type}:{issue.field}"
+
+            explanations[key] = self.explain_issue(issue)
+
+        return explanations 
